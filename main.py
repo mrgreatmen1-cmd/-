@@ -40,7 +40,6 @@ def normalize_url(url: str) -> str:
         return u
     if u.startswith(("telegra.ph/", "www.")):
         return "https://" + u
-    # if looks like domain/path
     if "." in u and " " not in u:
         return "https://" + u
     return ""
@@ -86,6 +85,9 @@ CURRENCY = "RUB"
 
 PAYMENTS_ENABLED = bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
 
+# Важно для стабильности на вебхуке: не обрабатывать апдейты параллельно
+MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "1"))
+
 
 def _require(name: str, value: str) -> None:
     if not value:
@@ -98,7 +100,6 @@ _require("COURSE_GROUP_CHAT_ID", COURSE_GROUP_CHAT_ID)
 _require("SUPABASE_URL", SUPABASE_URL)
 _require("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
 
-# YooKassa конфигурируем только если реально включена
 if PAYMENTS_ENABLED:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
@@ -248,7 +249,6 @@ def about_keyboard() -> InlineKeyboardMarkup:
 
 
 def support_keyboard() -> InlineKeyboardMarkup:
-    # Важно: Telegram НЕ принимает mailto: как url-кнопку -> Button_url_invalid
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back")]])
 
 
@@ -289,10 +289,9 @@ def check_keyboard() -> InlineKeyboardMarkup:
 
 
 # ----------------------------
-# UI helper: редактируем одно сообщение (без мусора) + fallback
+# UI helper
 # ----------------------------
 async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
-    # 1) пробуем HTML
     try:
         await q.message.edit_caption(
             caption=caption,
@@ -303,7 +302,6 @@ async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
     except Exception as ex:
         print("[edit_caption html] error:", repr(ex))
 
-    # 2) пробуем plain text (на всякий случай)
     try:
         await q.message.edit_caption(
             caption=e(caption),
@@ -313,7 +311,6 @@ async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
     except Exception as ex:
         print("[edit_caption plain] error:", repr(ex))
 
-    # 3) хотя бы клавиатуру обновим
     try:
         await q.message.edit_reply_markup(reply_markup=keyboard)
     except Exception as ex:
@@ -325,11 +322,8 @@ async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
 # ----------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-
-    # запись в Supabase не должна ломать ответ
     await safe_thread_call(db_upsert_started, user.id, user.username)
 
-    # Одно сообщение: фото + caption + кнопки
     try:
         with open(WELCOME_IMAGE_PATH, "rb") as f:
             await update.message.reply_photo(
@@ -529,7 +523,12 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 WEBHOOK_PATH = f"/bot/{TELEGRAM_BOT_TOKEN}"
 WEBHOOK_URL = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}"
 
-telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+telegram_app = (
+    Application.builder()
+    .token(TELEGRAM_BOT_TOKEN)
+    .concurrent_updates(MAX_CONCURRENT_UPDATES)  # <- важно для стабильности
+    .build()
+)
 
 telegram_app.add_handler(CommandHandler("start", cmd_start))
 telegram_app.add_handler(CallbackQueryHandler(on_pay, pattern="^pay$"))
@@ -562,6 +561,17 @@ async def root():
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+# ВАЖНО: Render часто делает HEAD-запросы. Без этих роутов может быть 405 -> SIGTERM.
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
+
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
 
 
 @app.post(WEBHOOK_PATH)
