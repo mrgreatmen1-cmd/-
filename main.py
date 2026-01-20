@@ -18,7 +18,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# YooKassa оставляем импорт, но использовать будем только когда появятся ключи
 from yookassa import Configuration, Payment
+
 from supabase import create_client
 
 
@@ -26,7 +28,14 @@ from supabase import create_client
 # ENV
 # ----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")  # https://xxx.onrender.com
+
+# Render часто даёт RENDER_EXTERNAL_URL автоматически
+PUBLIC_BASE_URL = (
+    os.getenv("PUBLIC_BASE_URL")
+    or os.getenv("RENDER_EXTERNAL_URL")
+    or ""
+).strip().rstrip("/")
+
 COURSE_GROUP_CHAT_ID = os.getenv("COURSE_GROUP_CHAT_ID", "").strip()    # e.g. -1001234567890
 
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "").strip()
@@ -35,16 +44,22 @@ YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-# Политики (как ты просил — через Telegraph). Если не задашь — бот покажет ссылку на страницу политики с сайта.
+# Политики (Telegraph)
 PRIVACY_URL = os.getenv("PRIVACY_URL", "https://ai-sistems-tgcurse.ru/privacy").strip()
 DATA_POLICY_URL = os.getenv("DATA_POLICY_URL", "https://ai-sistems-tgcurse.ru/privacy").strip()
 
-# Поддержка: можно оставить email с сайта по умолчанию
+# Поддержка
 SUPPORT_TEXT_EXTRA = os.getenv("SUPPORT_TEXT_EXTRA", "").strip()
+
+# Приветственная картинка
+WELCOME_IMAGE_PATH = os.getenv("WELCOME_IMAGE_PATH", "assets/welcome.png").strip()
 
 # Цена
 PRICE_RUB = "1000.00"
 CURRENCY = "RUB"
+
+# Флаг: включать оплату только когда есть ключи
+PAYMENTS_ENABLED = bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
 
 
 def _require(name: str, value: str) -> None:
@@ -52,13 +67,17 @@ def _require(name: str, value: str) -> None:
         raise RuntimeError(f"Missing env var: {name}")
 
 
+# Минимальные обязательные env для тестового запуска без ЮKassa:
 _require("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-_require("PUBLIC_BASE_URL", PUBLIC_BASE_URL)
+_require("PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL)", PUBLIC_BASE_URL)
 _require("COURSE_GROUP_CHAT_ID", COURSE_GROUP_CHAT_ID)
-_require("YOOKASSA_SHOP_ID", YOOKASSA_SHOP_ID)
-_require("YOOKASSA_SECRET_KEY", YOOKASSA_SECRET_KEY)
 _require("SUPABASE_URL", SUPABASE_URL)
 _require("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
+
+# YooKassa конфигурируем только если реально включена
+if PAYMENTS_ENABLED:
+    Configuration.account_id = YOOKASSA_SHOP_ID
+    Configuration.secret_key = YOOKASSA_SECRET_KEY
 
 
 # ----------------------------
@@ -68,7 +87,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 def db_upsert_started(telegram_id: int, username: str | None) -> None:
-    # upsert по telegram_id
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "telegram_id": telegram_id,
@@ -112,24 +130,15 @@ def db_get_user(telegram_id: int) -> dict | None:
 
 
 # ----------------------------
-# YooKassa
+# YooKassa (реальные функции — будут использоваться позже)
 # ----------------------------
-Configuration.account_id = YOOKASSA_SHOP_ID
-Configuration.secret_key = YOOKASSA_SECRET_KEY
-
-
 def yk_create_payment(telegram_id: int) -> tuple[str, str]:
-    """
-    Returns: (payment_id, confirmation_url)
-    """
     idem_key = str(uuid.uuid4())
 
     payment_data = {
         "amount": {"value": PRICE_RUB, "currency": CURRENCY},
         "confirmation": {
             "type": "redirect",
-            # После оплаты человек всё равно возвращается в Telegram вручную,
-            # поэтому return_url просто делаем валидным.
             "return_url": "https://ai-sistems-tgcurse.ru/",
         },
         "capture": True,
@@ -140,6 +149,7 @@ def yk_create_payment(telegram_id: int) -> tuple[str, str]:
     payment = Payment.create(payment_data, idem_key)
     payment_id = getattr(payment, "id", None) or payment.get("id")
     confirmation = getattr(payment, "confirmation", None) or payment.get("confirmation")
+
     confirmation_url = None
     if hasattr(confirmation, "confirmation_url"):
         confirmation_url = confirmation.confirmation_url
@@ -159,7 +169,7 @@ def yk_get_status(payment_id: str) -> str:
 
 
 # ----------------------------
-# Bot texts (по сайту)
+# Bot texts
 # ----------------------------
 WELCOME_TEXT = (
     "👋 Привет!\n\n"
@@ -186,6 +196,13 @@ SUPPORT_TEXT = (
     "Если что-то не получилось — напиши:\n"
     "• Email: ai.sistems59@gmail.com\n"
     "• Телефон: 8 993 197-02-11\n"
+)
+
+PAYMENTS_DISABLED_TEXT = (
+    "⛔️ *Оплата временно недоступна*\n\n"
+    "Сейчас бот запущен в тестовом режиме, ЮKassa ещё не подключена.\n"
+    "Доступ к курсу пока не выдаётся.\n\n"
+    "Скоро включим оплату — и всё заработает автоматически."
 )
 
 
@@ -216,10 +233,23 @@ def policies_keyboard() -> InlineKeyboardMarkup:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     db_upsert_started(user.id, user.username)
+
+    # 1) Фото + кнопки (короткая подпись, чтобы не упереться в лимит caption)
+    try:
+        with open(WELCOME_IMAGE_PATH, "rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption="👋 Добро пожаловать в курс «Telegram-бот за вечер»",
+                reply_markup=main_keyboard(),
+            )
+    except Exception:
+        # Если файла нет/путь неверный — просто пропускаем картинку
+        pass
+
+    # 2) Полный текст вторым сообщением (без кнопок, чтобы не дублировать)
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode="Markdown",
-        reply_markup=main_keyboard(),
         disable_web_page_preview=True,
     )
 
@@ -269,10 +299,20 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
 
+    # Заглушка: пока нет ключей — не даём оплату и не создаём платежи
+    if not PAYMENTS_ENABLED:
+        await q.message.reply_text(
+            PAYMENTS_DISABLED_TEXT,
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    # ----- Ниже будет рабочая логика, когда подключишь ЮKassa -----
     telegram_id = q.from_user.id
     user_row = db_get_user(telegram_id)
 
-    # Если уже оплачен — даём ссылку снова (или сообщаем)
     if user_row and user_row.get("paid"):
         invite_link = user_row.get("invite_link")
         if invite_link:
@@ -289,7 +329,6 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         return
 
-    # Создать платёж (в отдельном потоке, потому что SDK синхронный)
     try:
         payment_id, pay_url = await anyio.to_thread.run_sync(yk_create_payment, telegram_id)
         db_set_last_payment(telegram_id, payment_id)
@@ -323,6 +362,17 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
 
+    # Заглушка: пока нет ключей — никакой проверки и доступа
+    if not PAYMENTS_ENABLED:
+        await q.message.reply_text(
+            PAYMENTS_DISABLED_TEXT,
+            parse_mode="Markdown",
+            reply_markup=main_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    # ----- Ниже будет рабочая логика, когда подключишь ЮKassa -----
     telegram_id = q.from_user.id
     user_row = db_get_user(telegram_id)
 
@@ -361,7 +411,6 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if status == "succeeded":
-        # Создаём одноразовую бессрочную ссылку (member_limit=1), чтобы не утекала
         try:
             invite = await context.bot.create_chat_invite_link(
                 chat_id=int(COURSE_GROUP_CHAT_ID),
@@ -369,7 +418,6 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             invite_link = invite.invite_link
         except Exception as e:
-            # Оплату отметим, но ссылку не смогли — пусть пишет в поддержку
             db_mark_paid(telegram_id, payment_id, invite_link=None)
             await q.message.reply_text(
                 "✅ Оплата прошла!\n\n"
@@ -434,16 +482,13 @@ telegram_app.add_handler(CallbackQueryHandler(on_back, pattern="^(back)$"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Инициализация PTB
     await telegram_app.initialize()
     await telegram_app.start()
 
-    # Устанавливаем webhook
     await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
 
     yield
 
-    # выключение
     await telegram_app.bot.delete_webhook(drop_pending_updates=False)
     await telegram_app.stop()
     await telegram_app.shutdown()
@@ -454,7 +499,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "tg-payment-bot", "webhook": WEBHOOK_PATH}
+    return {"ok": True, "service": "tg-payment-bot", "webhook": WEBHOOK_PATH, "payments_enabled": PAYMENTS_ENABLED}
 
 
 @app.get("/health")
