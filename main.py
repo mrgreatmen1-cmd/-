@@ -2,6 +2,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from html import escape
 
 import anyio
 from fastapi import FastAPI, Request, Response
@@ -20,6 +21,38 @@ from telegram.ext import (
 
 from yookassa import Configuration, Payment
 from supabase import create_client
+
+
+# ----------------------------
+# helpers
+# ----------------------------
+def e(s: str) -> str:
+    """Escape for HTML parse_mode."""
+    return escape(s or "", quote=False)
+
+
+def normalize_url(url: str) -> str:
+    """Make URL Telegram-valid. Returns '' if can't be normalized."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith(("http://", "https://")):
+        return u
+    if u.startswith(("telegra.ph/", "www.")):
+        return "https://" + u
+    # if looks like domain/path
+    if "." in u and " " not in u:
+        return "https://" + u
+    return ""
+
+
+async def safe_thread_call(fn, *args, default=None):
+    """Чтобы бот не падал, если Supabase/сеть временно недоступны."""
+    try:
+        return await anyio.to_thread.run_sync(fn, *args)
+    except Exception as ex:
+        print(f"[safe_thread_call] {fn.__name__} error:", repr(ex))
+        return default
 
 
 # ----------------------------
@@ -65,6 +98,7 @@ _require("COURSE_GROUP_CHAT_ID", COURSE_GROUP_CHAT_ID)
 _require("SUPABASE_URL", SUPABASE_URL)
 _require("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
 
+# YooKassa конфигурируем только если реально включена
 if PAYMENTS_ENABLED:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
@@ -118,15 +152,6 @@ def db_get_user(telegram_id: int) -> dict | None:
     return data[0] if data else None
 
 
-async def safe_thread_call(fn, *args, default=None):
-    """Чтобы бот не падал, если Supabase/сеть временно недоступны."""
-    try:
-        return await anyio.to_thread.run_sync(fn, *args)
-    except Exception as e:
-        print(f"[safe_thread_call] {fn.__name__} error:", repr(e))
-        return default
-
-
 # ----------------------------
 # YooKassa (будет использоваться позже)
 # ----------------------------
@@ -163,36 +188,36 @@ def yk_get_status(payment_id: str) -> str:
 
 
 # ----------------------------
-# Texts (короткие — чтобы влезали в caption)
+# Texts (HTML — стабильнее, не ломается)
 # ----------------------------
 WELCOME_CAPTION = (
-    "👋 Привет! Добро пожаловать в курс «Telegram-бот за вечер».\n\n"
+    "👋 Привет! Добро пожаловать в курс <b>«Telegram-бот за вечер»</b>.\n\n"
     "🚀 Соберёшь бота с нуля и запустишь 24/7.\n"
     "Python → BotFather → Supabase → GitHub → Render → UptimeRobot + GPT.\n\n"
-    "💳 Цена: *1000₽* (доступ навсегда после оплаты)."
+    "💳 Цена: <b>1000₽</b> (доступ навсегда после оплаты)."
 )
 
 ABOUT_CAPTION = (
-    "📚 *О курсе*\n\n"
+    "📚 <b>О курсе</b>\n\n"
     "Курс из 4 видео: введение + 3 урока.\n"
     "Собираем бота, подключаем базу, деплоим в облако и (опционально) добавляем ИИ.\n\n"
-    "🔎 Подробная программа — по кнопке ниже."
+    "🔎 Подробности — на сайте."
 )
 
 SUPPORT_CAPTION = (
-    "🆘 *Поддержка*\n\n"
-    "• Email: ai.sistems59@gmail.com\n"
-    "• Телефон: 8 993 197-02-11"
+    "🆘 <b>Поддержка</b>\n\n"
+    "• Email: <b>ai.sistems59@gmail.com</b>\n"
+    "• Телефон: <b>8 993 197-02-11</b>"
 )
 
 PAYMENTS_DISABLED_CAPTION = (
-    "⛔️ *Оплата временно недоступна*\n\n"
+    "⛔️ <b>Оплата временно недоступна</b>\n\n"
     "Сейчас бот запущен в тестовом режиме — ЮKassa ещё не подключена.\n"
     "Доступ к курсу пока не выдаётся.\n\n"
     "Скоро включим оплату — и всё заработает автоматически."
 )
 
-POLICIES_CAPTION = "🔐 Политики"
+POLICIES_CAPTION = "🔐 <b>Политики</b>"
 
 
 # ----------------------------
@@ -214,32 +239,30 @@ def back_keyboard() -> InlineKeyboardMarkup:
 
 
 def about_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("Подробнее на сайте", url="https://ai-sistems-tgcurse.ru/")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def support_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    # можно добавить быстрые кнопки (опционально)
-    rows.append([InlineKeyboardButton("Написать на email", url="mailto:ai.sistems59@gmail.com")])
-    if SUPPORT_TEXT_EXTRA:
-        # extra текст не кнопкой, а просто останется в caption (ниже добавим)
-        pass
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
-    return InlineKeyboardMarkup(rows)
-
-
-def policies_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Политика конфиденциальности", url=PRIVACY_URL)],
-            [InlineKeyboardButton("Политика обработки данных", url=DATA_POLICY_URL)],
+            [InlineKeyboardButton("Подробнее на сайте", url="https://ai-sistems-tgcurse.ru/")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
         ]
     )
+
+
+def support_keyboard() -> InlineKeyboardMarkup:
+    # Важно: Telegram НЕ принимает mailto: как url-кнопку -> Button_url_invalid
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back")]])
+
+
+def policies_keyboard() -> InlineKeyboardMarkup:
+    p1 = normalize_url(PRIVACY_URL)
+    p2 = normalize_url(DATA_POLICY_URL)
+
+    rows = []
+    if p1:
+        rows.append([InlineKeyboardButton("Политика конфиденциальности", url=p1)])
+    if p2:
+        rows.append([InlineKeyboardButton("Политика обработки данных", url=p2)])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
 
 def pay_keyboard_disabled() -> InlineKeyboardMarkup:
@@ -266,28 +289,35 @@ def check_keyboard() -> InlineKeyboardMarkup:
 
 
 # ----------------------------
-# UI helper: редактируем одно сообщение (без мусора)
+# UI helper: редактируем одно сообщение (без мусора) + fallback
 # ----------------------------
 async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
-    """
-    Меняем caption и клавиатуру у того же сообщения.
-    Если edit_caption не сработал (редко) — просто меняем клавиатуру.
-    """
+    # 1) пробуем HTML
     try:
         await q.message.edit_caption(
             caption=caption,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
         return
-    except Exception as e:
-        # если, например, "message is not modified" или другие
-        print("[edit_caption] error:", repr(e))
+    except Exception as ex:
+        print("[edit_caption html] error:", repr(ex))
 
+    # 2) пробуем plain text (на всякий случай)
+    try:
+        await q.message.edit_caption(
+            caption=e(caption),
+            reply_markup=keyboard,
+        )
+        return
+    except Exception as ex:
+        print("[edit_caption plain] error:", repr(ex))
+
+    # 3) хотя бы клавиатуру обновим
     try:
         await q.message.edit_reply_markup(reply_markup=keyboard)
-    except Exception as e:
-        print("[edit_reply_markup] error:", repr(e))
+    except Exception as ex:
+        print("[edit_reply_markup] error:", repr(ex))
 
 
 # ----------------------------
@@ -305,14 +335,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_photo(
                 photo=f,
                 caption=WELCOME_CAPTION,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=main_keyboard(),
             )
-    except Exception as e:
-        print("Welcome image error:", repr(e))
+    except Exception as ex:
+        print("Welcome image error:", repr(ex))
         await update.message.reply_text(
             WELCOME_CAPTION,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=main_keyboard(),
             disable_web_page_preview=True,
         )
@@ -320,67 +350,78 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("answer error:", repr(ex))
     await edit_main_message(q, ABOUT_CAPTION, about_keyboard())
 
 
 async def on_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("answer error:", repr(ex))
+
     caption = SUPPORT_CAPTION
     if SUPPORT_TEXT_EXTRA:
-        caption += "\n" + SUPPORT_TEXT_EXTRA
+        caption += "\n\n" + e(SUPPORT_TEXT_EXTRA)
+
     await edit_main_message(q, caption, support_keyboard())
 
 
 async def on_policies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("answer error:", repr(ex))
     await edit_main_message(q, POLICIES_CAPTION, policies_keyboard())
 
 
 async def on_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("answer error:", repr(ex))
     await edit_main_message(q, WELCOME_CAPTION, main_keyboard())
 
 
 async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("answer error:", repr(ex))
 
     if not PAYMENTS_ENABLED:
         await edit_main_message(q, PAYMENTS_DISABLED_CAPTION, pay_keyboard_disabled())
         return
 
     telegram_id = q.from_user.id
-
     user_row = await safe_thread_call(db_get_user, telegram_id, default=None)
 
     if user_row and user_row.get("paid"):
         invite_link = user_row.get("invite_link") or ""
-        caption = "✅ *У тебя уже открыт доступ.*"
+        caption = "✅ <b>У тебя уже открыт доступ.</b>"
         if invite_link:
-            caption += f"\n\nВход в группу с курсом:\n{invite_link}"
+            caption += f"\n\nВход в группу с курсом:\n{e(invite_link)}"
         else:
             caption += "\n\nЕсли нужна ссылка — напиши в поддержку."
         await edit_main_message(q, caption, back_keyboard())
         return
 
-    # создать платеж
     try:
         payment_id, pay_url = await anyio.to_thread.run_sync(yk_create_payment, telegram_id)
         await safe_thread_call(db_set_last_payment, telegram_id, payment_id)
-    except Exception as e:
-        await edit_main_message(
-            q,
-            f"❌ Не получилось создать платёж.\n\nОшибка: {e}",
-            back_keyboard(),
-        )
+    except Exception as ex:
+        await edit_main_message(q, f"❌ Не получилось создать платёж.\n\n{e(str(ex))}", back_keyboard())
         return
 
     caption = (
-        "💳 *Оплата курса*\n\n"
+        "💳 <b>Оплата курса</b>\n\n"
         "1) Нажми «Перейти к оплате» и оплати 1000₽.\n"
         "2) Вернись сюда и нажми «Проверить оплату».\n\n"
         "После успешной оплаты я дам ссылку на вход в группу (доступ навсегда)."
@@ -390,7 +431,10 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("answer error:", repr(ex))
 
     if not PAYMENTS_ENABLED:
         await edit_main_message(q, PAYMENTS_DISABLED_CAPTION, pay_keyboard_disabled())
@@ -409,9 +453,9 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if user_row.get("paid"):
         invite_link = user_row.get("invite_link") or ""
-        caption = "✅ *Доступ уже открыт.*"
+        caption = "✅ <b>Доступ уже открыт.</b>"
         if invite_link:
-            caption += f"\n\nВход в группу:\n{invite_link}"
+            caption += f"\n\nВход в группу:\n{e(invite_link)}"
         else:
             caption += "\n\nЕсли нужна ссылка — напиши в поддержку."
         await edit_main_message(q, caption, back_keyboard())
@@ -421,26 +465,25 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         status = await anyio.to_thread.run_sync(yk_get_status, payment_id)
-    except Exception as e:
-        await edit_main_message(q, f"❌ Не получилось проверить платёж.\n\nОшибка: {e}", check_keyboard())
+    except Exception as ex:
+        await edit_main_message(q, f"❌ Не получилось проверить платёж.\n\n{e(str(ex))}", check_keyboard())
         return
 
     if status == "succeeded":
-        # создаём инвайт
         try:
             invite = await context.bot.create_chat_invite_link(
                 chat_id=int(COURSE_GROUP_CHAT_ID),
                 member_limit=1,
             )
             invite_link = invite.invite_link
-        except Exception as e:
+        except Exception as ex:
             await safe_thread_call(db_mark_paid, telegram_id, payment_id, None)
             await edit_main_message(
                 q,
                 "✅ Оплата прошла!\n\n"
                 "Но я не смог создать инвайт-ссылку автоматически.\n"
                 "Напиши в поддержку — вручную дадим доступ.\n\n"
-                f"Ошибка: {e}",
+                f"{e(str(ex))}",
                 back_keyboard(),
             )
             return
@@ -449,9 +492,9 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await edit_main_message(
             q,
-            "✅ *Оплата прошла!*\n\n"
+            "✅ <b>Оплата прошла!</b>\n\n"
             "Вот вход в группу с курсом (доступ навсегда):\n"
-            f"{invite_link}",
+            f"{e(invite_link)}",
             main_keyboard(),
         )
         return
@@ -475,7 +518,7 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await edit_main_message(
         q,
-        f"Статус платежа: {status}\nЕсли уверен(а), что оплатил(а), напиши в поддержку.",
+        f"Статус платежа: {e(status)}\nЕсли уверен(а), что оплатил(а), напиши в поддержку.",
         back_keyboard(),
     )
 
@@ -501,11 +544,8 @@ telegram_app.add_handler(CallbackQueryHandler(on_back, pattern="^(back)$"))
 async def lifespan(app: FastAPI):
     await telegram_app.initialize()
     await telegram_app.start()
-
     await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-
     yield
-
     await telegram_app.bot.delete_webhook(drop_pending_updates=False)
     await telegram_app.stop()
     await telegram_app.shutdown()
