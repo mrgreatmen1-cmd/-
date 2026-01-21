@@ -45,13 +45,38 @@ def normalize_url(url: str) -> str:
     return ""
 
 
-async def safe_thread_call(fn, *args, default=None):
-    """Чтобы бот не падал, если Supabase/сеть временно недоступны."""
+def _require(name: str, value: str) -> None:
+    if not value:
+        raise RuntimeError(f"Missing env var: {name}")
+
+
+# Таймауты (важно для стабильности)
+DB_TIMEOUT_SEC = float(os.getenv("DB_TIMEOUT_SEC", "4.0"))
+EDIT_TIMEOUT_SEC = float(os.getenv("EDIT_TIMEOUT_SEC", "4.0"))
+YK_TIMEOUT_SEC = float(os.getenv("YK_TIMEOUT_SEC", "8.0"))
+
+
+async def safe_thread_call(fn, *args, default=None, timeout_sec: float = DB_TIMEOUT_SEC):
+    """
+    Вызов синхронной функции в отдельном потоке + таймаут.
+    Если Supabase/сеть зависнет — бот НЕ повиснет.
+    """
     try:
-        return await anyio.to_thread.run_sync(fn, *args)
+        return await anyio.fail_after(timeout_sec, anyio.to_thread.run_sync, fn, *args)
+    except TimeoutError:
+        print(f"[safe_thread_call] {fn.__name__} timeout after {timeout_sec}s")
+        return default
     except Exception as ex:
         print(f"[safe_thread_call] {fn.__name__} error:", repr(ex))
         return default
+
+
+async def safe_answer(q):
+    """Всегда пытаемся быстро закрыть 'loading' у кнопки."""
+    try:
+        await q.answer()
+    except Exception as ex:
+        print("[callback answer] error:", repr(ex))
 
 
 # ----------------------------
@@ -85,13 +110,11 @@ CURRENCY = "RUB"
 
 PAYMENTS_ENABLED = bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
 
-# Важно для стабильности на вебхуке: не обрабатывать апдейты параллельно
+# Важно для стабильности: не обрабатывать апдейты параллельно
 MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "1"))
 
-
-def _require(name: str, value: str) -> None:
-    if not value:
-        raise RuntimeError(f"Missing env var: {name}")
+# ✅ Секретный путь вебхука (вместо токена в URL)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 
 _require("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
@@ -99,6 +122,7 @@ _require("PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL)", PUBLIC_BASE_URL)
 _require("COURSE_GROUP_CHAT_ID", COURSE_GROUP_CHAT_ID)
 _require("SUPABASE_URL", SUPABASE_URL)
 _require("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
+_require("WEBHOOK_SECRET", WEBHOOK_SECRET)
 
 if PAYMENTS_ENABLED:
     Configuration.account_id = YOOKASSA_SHOP_ID
@@ -154,7 +178,7 @@ def db_get_user(telegram_id: int) -> dict | None:
 
 
 # ----------------------------
-# YooKassa (будет использоваться позже)
+# YooKassa
 # ----------------------------
 def yk_create_payment(telegram_id: int) -> tuple[str, str]:
     idem_key = str(uuid.uuid4())
@@ -189,7 +213,7 @@ def yk_get_status(payment_id: str) -> str:
 
 
 # ----------------------------
-# Texts (HTML — стабильнее, не ломается)
+# Texts (HTML)
 # ----------------------------
 WELCOME_CAPTION = (
     "👋 Привет! Добро пожаловать в курс <b>«Telegram-бот за вечер»</b>.\n\n"
@@ -292,10 +316,13 @@ def check_keyboard() -> InlineKeyboardMarkup:
 # UI helper
 # ----------------------------
 async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
+    # редактирование тоже иногда может подвиснуть на стороне Telegram — ставим таймаут
     try:
-        await q.message.edit_caption(
-            caption=caption,
-            parse_mode="HTML",
+        await anyio.fail_after(
+            EDIT_TIMEOUT_SEC,
+            q.message.edit_caption,
+            caption,
+            "HTML",
             reply_markup=keyboard,
         )
         return
@@ -303,8 +330,11 @@ async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
         print("[edit_caption html] error:", repr(ex))
 
     try:
-        await q.message.edit_caption(
-            caption=e(caption),
+        await anyio.fail_after(
+            EDIT_TIMEOUT_SEC,
+            q.message.edit_caption,
+            e(caption),
+            None,
             reply_markup=keyboard,
         )
         return
@@ -312,7 +342,7 @@ async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
         print("[edit_caption plain] error:", repr(ex))
 
     try:
-        await q.message.edit_reply_markup(reply_markup=keyboard)
+        await anyio.fail_after(EDIT_TIMEOUT_SEC, q.message.edit_reply_markup, reply_markup=keyboard)
     except Exception as ex:
         print("[edit_reply_markup] error:", repr(ex))
 
@@ -344,19 +374,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as ex:
-        print("answer error:", repr(ex))
+    await safe_answer(q)
     await edit_main_message(q, ABOUT_CAPTION, about_keyboard())
 
 
 async def on_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as ex:
-        print("answer error:", repr(ex))
+    await safe_answer(q)
 
     caption = SUPPORT_CAPTION
     if SUPPORT_TEXT_EXTRA:
@@ -367,28 +391,19 @@ async def on_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def on_policies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as ex:
-        print("answer error:", repr(ex))
+    await safe_answer(q)
     await edit_main_message(q, POLICIES_CAPTION, policies_keyboard())
 
 
 async def on_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as ex:
-        print("answer error:", repr(ex))
+    await safe_answer(q)
     await edit_main_message(q, WELCOME_CAPTION, main_keyboard())
 
 
 async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as ex:
-        print("answer error:", repr(ex))
+    await safe_answer(q)
 
     if not PAYMENTS_ENABLED:
         await edit_main_message(q, PAYMENTS_DISABLED_CAPTION, pay_keyboard_disabled())
@@ -407,8 +422,14 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_main_message(q, caption, back_keyboard())
         return
 
+    # YooKassa create может зависнуть — ставим таймаут
     try:
-        payment_id, pay_url = await anyio.to_thread.run_sync(yk_create_payment, telegram_id)
+        payment_id, pay_url = await anyio.fail_after(
+            YK_TIMEOUT_SEC,
+            anyio.to_thread.run_sync,
+            yk_create_payment,
+            telegram_id,
+        )
         await safe_thread_call(db_set_last_payment, telegram_id, payment_id)
     except Exception as ex:
         await edit_main_message(q, f"❌ Не получилось создать платёж.\n\n{e(str(ex))}", back_keyboard())
@@ -425,10 +446,7 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception as ex:
-        print("answer error:", repr(ex))
+    await safe_answer(q)
 
     if not PAYMENTS_ENABLED:
         await edit_main_message(q, PAYMENTS_DISABLED_CAPTION, pay_keyboard_disabled())
@@ -458,14 +476,21 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     payment_id = user_row["last_payment_id"]
 
     try:
-        status = await anyio.to_thread.run_sync(yk_get_status, payment_id)
+        status = await anyio.fail_after(
+            YK_TIMEOUT_SEC,
+            anyio.to_thread.run_sync,
+            yk_get_status,
+            payment_id,
+        )
     except Exception as ex:
         await edit_main_message(q, f"❌ Не получилось проверить платёж.\n\n{e(str(ex))}", check_keyboard())
         return
 
     if status == "succeeded":
         try:
-            invite = await context.bot.create_chat_invite_link(
+            invite = await anyio.fail_after(
+                EDIT_TIMEOUT_SEC,
+                context.bot.create_chat_invite_link,
                 chat_id=int(COURSE_GROUP_CHAT_ID),
                 member_limit=1,
             )
@@ -520,7 +545,7 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ----------------------------
 # FastAPI + webhook glue
 # ----------------------------
-WEBHOOK_PATH = f"/bot/{TELEGRAM_BOT_TOKEN}"
+WEBHOOK_PATH = f"/bot/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}"
 
 telegram_app = (
@@ -543,9 +568,24 @@ telegram_app.add_handler(CallbackQueryHandler(on_back, pattern="^(back)$"))
 async def lifespan(app: FastAPI):
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+    # ✅ self-heal webhook: если Telegram вдруг сбросил/изменил url — восстановим
+    try:
+        info = await telegram_app.bot.get_webhook_info()
+        if (not info.url) or (info.url != WEBHOOK_URL):
+            await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        else:
+            await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=False)
+    except Exception as ex:
+        print("[webhook setup] error:", repr(ex))
+
     yield
-    await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+
+    try:
+        await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception as ex:
+        print("[webhook delete] error:", repr(ex))
+
     await telegram_app.stop()
     await telegram_app.shutdown()
 
@@ -555,7 +595,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "tg-payment-bot", "webhook": WEBHOOK_PATH, "payments_enabled": PAYMENTS_ENABLED}
+    return {"ok": True, "service": "tg-payment-bot", "payments_enabled": PAYMENTS_ENABLED}
 
 
 @app.get("/health")
@@ -573,7 +613,6 @@ async def health_head():
     return Response(status_code=200)
 
 
-# ✅ ДОБАВЛЕНО: debug для проверки и ручного ресета webhook
 @app.get("/debug/webhook")
 async def debug_webhook():
     info = await telegram_app.bot.get_webhook_info()
