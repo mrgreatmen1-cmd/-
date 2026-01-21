@@ -269,7 +269,6 @@ ABOUT_CAPTION = (
 SUPPORT_CAPTION = (
     "🆘 <b>Поддержка</b>\n\n"
     "• Email: <b>ai.sistems59@gmail.com</b>\n"
-    "• Телефон: <b>8 993 197-02-11</b>"
 )
 
 PAYMENTS_DISABLED_CAPTION = (
@@ -838,3 +837,4 @@ async def telegram_webhook(request: Request) -> Response:
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return Response(status_code=200)
+
