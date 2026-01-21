@@ -3,16 +3,24 @@ import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from html import escape
+from typing import Optional
 
 import anyio
 from fastapi import FastAPI, Request, Response
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 from yookassa import Configuration, Payment
@@ -47,16 +55,31 @@ def _require(name: str, value: str) -> None:
 
 
 # Таймауты (важно для стабильности)
-DB_TIMEOUT_SEC = float(os.getenv("DB_TIMEOUT_SEC", "4.0"))
-EDIT_TIMEOUT_SEC = float(os.getenv("EDIT_TIMEOUT_SEC", "4.0"))
-YK_TIMEOUT_SEC = float(os.getenv("YK_TIMEOUT_SEC", "8.0"))
+DB_TIMEOUT_SEC = float(os.getenv("DB_TIMEOUT_SEC", "6.0"))
+EDIT_TIMEOUT_SEC = float(os.getenv("EDIT_TIMEOUT_SEC", "6.0"))
+YK_TIMEOUT_SEC = float(os.getenv("YK_TIMEOUT_SEC", "12.0"))
+
+# Важно для стабильности: не обрабатывать апдейты параллельно
+MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "1"))
+
+# Админ(ы)
+ADMIN_TELEGRAM_ID_RAW = os.getenv("ADMIN_TELEGRAM_ID", "").strip()  # "123" or "123,456"
+ADMIN_IDS = set()
+if ADMIN_TELEGRAM_ID_RAW:
+    for part in ADMIN_TELEGRAM_ID_RAW.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ADMIN_IDS.add(int(part))
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 async def safe_thread_call(fn, *args, default=None, timeout_sec: float = DB_TIMEOUT_SEC):
     """
     Вызов синхронной функции в отдельном потоке + таймаут.
     Если Supabase/сеть зависнет — бот НЕ повиснет.
-    (Fix: anyio.fail_after is a context manager in AnyIO v4)
     """
     try:
         with anyio.fail_after(timeout_sec):
@@ -107,9 +130,6 @@ PRICE_RUB = "1000.00"
 CURRENCY = "RUB"
 
 PAYMENTS_ENABLED = bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
-
-# Важно для стабильности: не обрабатывать апдейты параллельно
-MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "1"))
 
 # ✅ Секретный путь вебхука (вместо токена в URL)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -173,6 +193,25 @@ def db_get_user(telegram_id: int) -> dict | None:
     )
     data = res.data or []
     return data[0] if data else None
+
+
+def db_list_user_ids_by_paid(paid: bool) -> list[int]:
+    # Выбираем только telegram_id
+    res = (
+        supabase.table("tg_users")
+        .select("telegram_id")
+        .eq("paid", paid)
+        .execute()
+    )
+    rows = res.data or []
+    out = []
+    for r in rows:
+        tid = r.get("telegram_id")
+        try:
+            out.append(int(tid))
+        except Exception:
+            pass
+    return out
 
 
 # ----------------------------
@@ -246,15 +285,16 @@ POLICIES_CAPTION = "🔐 <b>Политики</b>"
 # ----------------------------
 # Keyboards
 # ----------------------------
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💳 Оплатить курс — 1000₽", callback_data="pay")],
-            [InlineKeyboardButton("📚 О курсе", callback_data="about")],
-            [InlineKeyboardButton("🆘 Поддержка", callback_data="support")],
-            [InlineKeyboardButton("🔐 Политики", callback_data="policies")],
-        ]
-    )
+def main_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("💳 Оплатить курс — 1000₽", callback_data="pay")],
+        [InlineKeyboardButton("📚 О курсе", callback_data="about")],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="support")],
+        [InlineKeyboardButton("🔐 Политики", callback_data="policies")],
+    ]
+    if is_admin_user:
+        rows.append([InlineKeyboardButton("📣 Рассылка (админ)", callback_data="admin_broadcast")])
+    return InlineKeyboardMarkup(rows)
 
 
 def back_keyboard() -> InlineKeyboardMarkup:
@@ -310,11 +350,24 @@ def check_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def admin_broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Оплатили", callback_data="broadcast_paid")],
+            [InlineKeyboardButton("❌ Не оплатили", callback_data="broadcast_unpaid")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+    )
+
+
+def admin_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel")]])
+
+
 # ----------------------------
 # UI helper
 # ----------------------------
 async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
-    # редактирование тоже иногда может подвиснуть на стороне Telegram — ставим таймаут
     try:
         with anyio.fail_after(EDIT_TIMEOUT_SEC):
             await q.message.edit_caption(
@@ -350,20 +403,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await safe_thread_call(db_upsert_started, user.id, user.username)
 
+    kb = main_keyboard(is_admin_user=is_admin(user.id))
+
     try:
         with open(WELCOME_IMAGE_PATH, "rb") as f:
             await update.message.reply_photo(
                 photo=f,
                 caption=WELCOME_CAPTION,
                 parse_mode="HTML",
-                reply_markup=main_keyboard(),
+                reply_markup=kb,
             )
     except Exception as ex:
         print("Welcome image error:", repr(ex))
         await update.message.reply_text(
             WELCOME_CAPTION,
             parse_mode="HTML",
-            reply_markup=main_keyboard(),
+            reply_markup=kb,
             disable_web_page_preview=True,
         )
 
@@ -394,7 +449,8 @@ async def on_policies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def on_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await safe_answer(q)
-    await edit_main_message(q, WELCOME_CAPTION, main_keyboard())
+    is_admin_user = is_admin(q.from_user.id)
+    await edit_main_message(q, WELCOME_CAPTION, main_keyboard(is_admin_user=is_admin_user))
 
 
 async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -418,7 +474,6 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_main_message(q, caption, back_keyboard())
         return
 
-    # YooKassa create может зависнуть — ставим таймаут
     try:
         with anyio.fail_after(YK_TIMEOUT_SEC):
             payment_id, pay_url = await anyio.to_thread.run_sync(yk_create_payment, telegram_id)
@@ -501,7 +556,7 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "✅ <b>Оплата прошла!</b>\n\n"
             "Вот вход в группу с курсом (доступ навсегда):\n"
             f"{e(invite_link)}",
-            main_keyboard(),
+            main_keyboard(is_admin_user=is_admin(telegram_id)),
         )
         return
 
@@ -518,7 +573,7 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_main_message(
             q,
             "❌ Платёж отменён.\nНажми «Оплатить курс — 1000₽», чтобы создать новую ссылку.",
-            main_keyboard(),
+            main_keyboard(is_admin_user=is_admin(telegram_id)),
         )
         return
 
@@ -527,6 +582,142 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Статус платежа: {e(status)}\nЕсли уверен(а), что оплатил(а), напиши в поддержку.",
         back_keyboard(),
     )
+
+
+# ----------------------------
+# Admin broadcast flow
+# ----------------------------
+BCAST_CHOOSE_AUDIENCE, BCAST_ENTER_TEXT, BCAST_CONFIRM = range(3)
+
+
+async def on_admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await safe_answer(q)
+
+    if not is_admin(q.from_user.id):
+        await edit_main_message(q, "⛔️ Нет доступа.", back_keyboard())
+        return ConversationHandler.END
+
+    await edit_main_message(q, "📣 <b>Рассылка</b>\n\nКому отправляем?", admin_broadcast_keyboard())
+    return BCAST_CHOOSE_AUDIENCE
+
+
+async def on_broadcast_choose_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await safe_answer(q)
+
+    if not is_admin(q.from_user.id):
+        return ConversationHandler.END
+
+    context.user_data["bcast_paid"] = True
+    await edit_main_message(q, "✍️ Пришли текст рассылки одним сообщением.\n\n(Можно HTML, но без сложных тегов)", admin_cancel_keyboard())
+    return BCAST_ENTER_TEXT
+
+
+async def on_broadcast_choose_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await safe_answer(q)
+
+    if not is_admin(q.from_user.id):
+        return ConversationHandler.END
+
+    context.user_data["bcast_paid"] = False
+    await edit_main_message(q, "✍️ Пришли текст рассылки одним сообщением.\n\n(Можно HTML, но без сложных тегов)", admin_cancel_keyboard())
+    return BCAST_ENTER_TEXT
+
+
+async def on_broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await safe_answer(q)
+    context.user_data.pop("bcast_paid", None)
+    context.user_data.pop("bcast_text", None)
+
+    await edit_main_message(q, WELCOME_CAPTION, main_keyboard(is_admin_user=is_admin(q.from_user.id)))
+    return ConversationHandler.END
+
+
+async def on_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Пришли текст одним сообщением.")
+        return BCAST_ENTER_TEXT
+
+    context.user_data["bcast_text"] = text
+    paid = bool(context.user_data.get("bcast_paid", False))
+    audience_name = "✅ оплатившим" if paid else "❌ не оплатившим"
+
+    preview = (
+        f"📣 <b>Подтверждение рассылки</b>\n\n"
+        f"Кому: <b>{audience_name}</b>\n\n"
+        f"Текст:\n\n{text}\n\n"
+        f"Отправить?"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Отправить", callback_data="broadcast_send")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel")],
+        ]
+    )
+    await update.message.reply_text(preview, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    return BCAST_CONFIRM
+
+
+async def on_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await safe_answer(q)
+
+    if not is_admin(q.from_user.id):
+        return ConversationHandler.END
+
+    paid = bool(context.user_data.get("bcast_paid", False))
+    text = context.user_data.get("bcast_text", "")
+    if not text:
+        await edit_main_message(q, "Текст рассылки не найден. Начни заново.", back_keyboard())
+        return ConversationHandler.END
+
+    user_ids = await safe_thread_call(db_list_user_ids_by_paid, paid, default=[])
+    total = len(user_ids)
+
+    # Сразу покажем статус
+    await edit_main_message(q, f"⏳ Отправляю... получателей: <b>{total}</b>", back_keyboard())
+
+    sent = 0
+    failed = 0
+
+    # Чтобы не словить флуд-лимиты Telegram
+    async def send_one(uid: int):
+        nonlocal sent, failed
+        try:
+            with anyio.fail_after(10):
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    for uid in user_ids:
+        await send_one(uid)
+        # небольшая пауза
+        await anyio.sleep(0.05)
+
+    summary = (
+        "✅ <b>Рассылка завершена</b>\n\n"
+        f"Получателей: <b>{total}</b>\n"
+        f"Отправлено: <b>{sent}</b>\n"
+        f"Ошибок: <b>{failed}</b>"
+    )
+    await edit_main_message(q, summary, main_keyboard(is_admin_user=True))
+
+    context.user_data.pop("bcast_paid", None)
+    context.user_data.pop("bcast_text", None)
+    return ConversationHandler.END
 
 
 # ----------------------------
@@ -550,13 +741,37 @@ telegram_app.add_handler(CallbackQueryHandler(on_support, pattern="^support$"))
 telegram_app.add_handler(CallbackQueryHandler(on_policies, pattern="^policies$"))
 telegram_app.add_handler(CallbackQueryHandler(on_back, pattern="^(back)$"))
 
+# Admin broadcast conversation
+broadcast_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(on_admin_broadcast_menu, pattern="^admin_broadcast$")],
+    states={
+        BCAST_CHOOSE_AUDIENCE: [
+            CallbackQueryHandler(on_broadcast_choose_paid, pattern="^broadcast_paid$"),
+            CallbackQueryHandler(on_broadcast_choose_unpaid, pattern="^broadcast_unpaid$"),
+            CallbackQueryHandler(on_broadcast_cancel, pattern="^broadcast_cancel$"),
+        ],
+        BCAST_ENTER_TEXT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, on_broadcast_text),
+            CallbackQueryHandler(on_broadcast_cancel, pattern="^broadcast_cancel$"),
+        ],
+        BCAST_CONFIRM: [
+            CallbackQueryHandler(on_broadcast_send, pattern="^broadcast_send$"),
+            CallbackQueryHandler(on_broadcast_cancel, pattern="^broadcast_cancel$"),
+        ],
+    },
+    fallbacks=[CallbackQueryHandler(on_broadcast_cancel, pattern="^broadcast_cancel$")],
+    per_user=True,
+    per_chat=True,
+)
+telegram_app.add_handler(broadcast_conv)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await telegram_app.initialize()
     await telegram_app.start()
 
-    # ✅ self-heal webhook: если Telegram вдруг сбросил/изменил url — восстановим
+    # ✅ self-heal webhook (и НЕ удаляем его на shutdown)
     try:
         info = await telegram_app.bot.get_webhook_info()
         if (not info.url) or (info.url != WEBHOOK_URL):
@@ -568,13 +783,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # ВАЖНО: НЕ delete_webhook() на Render, иначе после рестарта Telegram перестанет слать апдейты
     try:
-        await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+        await telegram_app.stop()
+        await telegram_app.shutdown()
     except Exception as ex:
-        print("[webhook delete] error:", repr(ex))
-
-    await telegram_app.stop()
-    await telegram_app.shutdown()
+        print("[app stop/shutdown] error:", repr(ex))
 
 
 app = FastAPI(lifespan=lifespan)
