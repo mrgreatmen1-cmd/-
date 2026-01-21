@@ -526,7 +526,7 @@ WEBHOOK_URL = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}"
 telegram_app = (
     Application.builder()
     .token(TELEGRAM_BOT_TOKEN)
-    .concurrent_updates(MAX_CONCURRENT_UPDATES)  # <- важно для стабильности
+    .concurrent_updates(MAX_CONCURRENT_UPDATES)
     .build()
 )
 
@@ -563,7 +563,6 @@ async def health():
     return {"ok": True}
 
 
-# ВАЖНО: Render часто делает HEAD-запросы. Без этих роутов может быть 405 -> SIGTERM.
 @app.head("/")
 async def root_head():
     return Response(status_code=200)
@@ -572,6 +571,25 @@ async def root_head():
 @app.head("/health")
 async def health_head():
     return Response(status_code=200)
+
+
+# ✅ ДОБАВЛЕНО: debug для проверки и ручного ресета webhook
+@app.get("/debug/webhook")
+async def debug_webhook():
+    info = await telegram_app.bot.get_webhook_info()
+    return {
+        "expected": WEBHOOK_URL,
+        "current_url": info.url,
+        "pending_update_count": info.pending_update_count,
+        "last_error_date": info.last_error_date,
+        "last_error_message": info.last_error_message,
+    }
+
+
+@app.get("/debug/reset-webhook")
+async def debug_reset_webhook():
+    await telegram_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    return {"ok": True, "set_to": WEBHOOK_URL}
 
 
 @app.post(WEBHOOK_PATH)
