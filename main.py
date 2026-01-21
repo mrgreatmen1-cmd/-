@@ -7,11 +7,7 @@ from html import escape
 import anyio
 from fastapi import FastAPI, Request, Response
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -60,9 +56,11 @@ async def safe_thread_call(fn, *args, default=None, timeout_sec: float = DB_TIME
     """
     Вызов синхронной функции в отдельном потоке + таймаут.
     Если Supabase/сеть зависнет — бот НЕ повиснет.
+    (Fix: anyio.fail_after is a context manager in AnyIO v4)
     """
     try:
-        return await anyio.fail_after(timeout_sec, anyio.to_thread.run_sync, fn, *args)
+        with anyio.fail_after(timeout_sec):
+            return await anyio.to_thread.run_sync(fn, *args)
     except TimeoutError:
         print(f"[safe_thread_call] {fn.__name__} timeout after {timeout_sec}s")
         return default
@@ -318,31 +316,29 @@ def check_keyboard() -> InlineKeyboardMarkup:
 async def edit_main_message(q, caption: str, keyboard: InlineKeyboardMarkup):
     # редактирование тоже иногда может подвиснуть на стороне Telegram — ставим таймаут
     try:
-        await anyio.fail_after(
-            EDIT_TIMEOUT_SEC,
-            q.message.edit_caption,
-            caption,
-            "HTML",
-            reply_markup=keyboard,
-        )
+        with anyio.fail_after(EDIT_TIMEOUT_SEC):
+            await q.message.edit_caption(
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
         return
     except Exception as ex:
         print("[edit_caption html] error:", repr(ex))
 
     try:
-        await anyio.fail_after(
-            EDIT_TIMEOUT_SEC,
-            q.message.edit_caption,
-            e(caption),
-            None,
-            reply_markup=keyboard,
-        )
+        with anyio.fail_after(EDIT_TIMEOUT_SEC):
+            await q.message.edit_caption(
+                caption=e(caption),
+                reply_markup=keyboard,
+            )
         return
     except Exception as ex:
         print("[edit_caption plain] error:", repr(ex))
 
     try:
-        await anyio.fail_after(EDIT_TIMEOUT_SEC, q.message.edit_reply_markup, reply_markup=keyboard)
+        with anyio.fail_after(EDIT_TIMEOUT_SEC):
+            await q.message.edit_reply_markup(reply_markup=keyboard)
     except Exception as ex:
         print("[edit_reply_markup] error:", repr(ex))
 
@@ -424,12 +420,8 @@ async def on_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # YooKassa create может зависнуть — ставим таймаут
     try:
-        payment_id, pay_url = await anyio.fail_after(
-            YK_TIMEOUT_SEC,
-            anyio.to_thread.run_sync,
-            yk_create_payment,
-            telegram_id,
-        )
+        with anyio.fail_after(YK_TIMEOUT_SEC):
+            payment_id, pay_url = await anyio.to_thread.run_sync(yk_create_payment, telegram_id)
         await safe_thread_call(db_set_last_payment, telegram_id, payment_id)
     except Exception as ex:
         await edit_main_message(q, f"❌ Не получилось создать платёж.\n\n{e(str(ex))}", back_keyboard())
@@ -476,24 +468,19 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     payment_id = user_row["last_payment_id"]
 
     try:
-        status = await anyio.fail_after(
-            YK_TIMEOUT_SEC,
-            anyio.to_thread.run_sync,
-            yk_get_status,
-            payment_id,
-        )
+        with anyio.fail_after(YK_TIMEOUT_SEC):
+            status = await anyio.to_thread.run_sync(yk_get_status, payment_id)
     except Exception as ex:
         await edit_main_message(q, f"❌ Не получилось проверить платёж.\n\n{e(str(ex))}", check_keyboard())
         return
 
     if status == "succeeded":
         try:
-            invite = await anyio.fail_after(
-                EDIT_TIMEOUT_SEC,
-                context.bot.create_chat_invite_link,
-                chat_id=int(COURSE_GROUP_CHAT_ID),
-                member_limit=1,
-            )
+            with anyio.fail_after(EDIT_TIMEOUT_SEC):
+                invite = await context.bot.create_chat_invite_link(
+                    chat_id=int(COURSE_GROUP_CHAT_ID),
+                    member_limit=1,
+                )
             invite_link = invite.invite_link
         except Exception as ex:
             await safe_thread_call(db_mark_paid, telegram_id, payment_id, None)
