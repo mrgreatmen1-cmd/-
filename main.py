@@ -318,8 +318,7 @@ POLICIES_CAPTION = "🔐 <b>Политики</b>"
 
 NEED_EMAIL_CAPTION = (
     "📧 <b>Нужен email для чека</b>\n\n"
-    "У тебя подключены «Чеки от ЮKassa», чек отправляется на почту.\n"
-    "Отправь, пожалуйста, email одним сообщением (пример: name@gmail.com)."
+    "Отправь, пожалуйста, свой email одним сообщением (пример: name@gmail.com)."
 )
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -959,3 +958,4 @@ async def telegram_webhook(request: Request) -> Response:
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return Response(status_code=200)
+
